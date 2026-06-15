@@ -17,6 +17,7 @@ class Order:
     order_time: str
     recipient: str
     address: str
+    user_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -26,3 +27,15 @@ class Logistics:
     tracking_no: str
     status: str
     traces: list[LogisticsTrace] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AfterSale:
+    ticket_id: str
+    order_id: str
+    type: str        # refund / return / exchange
+    status: str      # 待审核 / 已通过 / 已拒绝 / 已完成
+    reason: str
+    created_at: str
+    updated_at: str
+    user_id: str = ""

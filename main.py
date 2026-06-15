@@ -12,11 +12,17 @@ from fastapi.responses import FileResponse
 from llm import chat_service, LangChainChatModel
 from utils import ConversationManager
 from tools import (
-    search_faq_tool, query_order_tool, query_logistics_tool, place_order_tool,
+    search_faq_tool, query_order_tool, query_logistics_tool,
+    place_order_tool, query_after_sale_tool, query_cart_tool, list_my_orders_tool,
 )
 from domain.customer_service import MasterAgent
 
 from apps.customer_service.routes import router as cs_router
+from apps.shop.c_endpoint.auth import router as shop_auth_router
+from apps.shop.c_endpoint.product import router as shop_product_router
+from apps.shop.c_endpoint.order import router as shop_order_router
+from apps.shop.b_endpoint.admin import router as shop_admin_router
+from apps.shop.internal.routes import router as shop_internal_router
 
 # ── Dependency assembly ──
 lc_llm = LangChainChatModel(chat_service=chat_service)
@@ -24,7 +30,9 @@ conversation_manager = ConversationManager(max_context_turns=10)
 agent = MasterAgent(
     llm=lc_llm,
     conversation_manager=conversation_manager,
-    tools=[search_faq_tool, query_order_tool, query_logistics_tool, place_order_tool],
+    tools=[search_faq_tool, query_order_tool, query_logistics_tool,
+           query_after_sale_tool, place_order_tool, query_cart_tool,
+           list_my_orders_tool],
 )
 
 # Inject into routes module
@@ -35,6 +43,11 @@ cs_routes.conversation_manager = conversation_manager
 # ── FastAPI app ──
 app = FastAPI(title="RAG Customer Service Agent")
 app.include_router(cs_router)
+app.include_router(shop_auth_router)
+app.include_router(shop_product_router)
+app.include_router(shop_order_router)
+app.include_router(shop_admin_router)
+app.include_router(shop_internal_router)
 
 # ── Static files ──
 static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")

@@ -1,6 +1,7 @@
 """LangGraphAgent + MasterAgent — single and multi-agent graph wrappers."""
 import asyncio
 import json
+import os
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage
 
@@ -8,6 +9,21 @@ from domain.customer_service.graph import build_graph
 from domain.customer_service.master_graph import build_master_graph
 from domain.customer_service.agent import AgentResponse
 from domain.customer_service.prompts import LANGRAPH_SYSTEM_PROMPT
+
+CHECKPOINT_DB_PATH = os.getenv("CHECKPOINT_DB_PATH", "./checkpoints.db")
+
+
+def _create_checkpointer():
+    """Create a persistent AsyncSqliteSaver (supports sync + async), fallback to MemorySaver."""
+    try:
+        import sqlite3
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        conn = sqlite3.connect(CHECKPOINT_DB_PATH, check_same_thread=False)
+        saver = AsyncSqliteSaver(conn)
+        saver.setup()
+        return saver
+    except Exception:
+        return MemorySaver()
 
 
 class LangGraphAgent:
@@ -26,7 +42,7 @@ class LangGraphAgent:
         self.llm = llm  # LangChainChatModel (already wrapped)
         self.langchain_tools = [t.to_langchain_tool() for t in tools]
         self.llm_with_tools = self.llm.bind_tools(self.langchain_tools)
-        self.checkpointer = checkpointer or MemorySaver()
+        self.checkpointer = checkpointer or _create_checkpointer()
         self.graph = build_graph(
             llm_with_tools=self.llm_with_tools,
             langchain_tools=self.langchain_tools,
@@ -88,6 +104,9 @@ _NODE_DISPLAY = {
     "faq_agent": ("FAQ Agent 检索知识库中...", "faq_agent"),
     "order_agent": ("订单 Agent 查询中...", "order_agent"),
     "logistics_agent": ("物流 Agent 查询中...", "logistics_agent"),
+    "after_sale_agent": ("售后 Agent 查询中...", "after_sale_agent"),
+    "cart_query_agent": ("购物车 Agent 查询中...", "cart_query"),
+    "list_orders_agent": ("订单列表 Agent 查询中...", "list_orders"),
     "place_order_agent": ("下单 Agent 处理中...", "place_order_agent"),
     "finish": ("正在生成回复...", "finish"),
 }
@@ -106,8 +125,11 @@ class MasterAgent:
         self.search_faq_tool = tool_map.get("search_faq")
         self.query_order_tool = tool_map.get("query_order")
         self.query_logistics_tool = tool_map.get("query_logistics")
+        self.query_after_sale_tool = tool_map.get("query_after_sale")
+        self.query_cart_tool = tool_map.get("query_cart")
+        self.list_my_orders_tool = tool_map.get("list_my_orders")
         self.place_order_tool = tool_map.get("place_order")
-        self.checkpointer = checkpointer or MemorySaver()
+        self.checkpointer = checkpointer or _create_checkpointer()
 
         if not all([self.search_faq_tool, self.query_order_tool, self.query_logistics_tool]):
             missing = [n for n, t in [("search_faq", self.search_faq_tool),
@@ -120,13 +142,16 @@ class MasterAgent:
             search_faq_tool=self.search_faq_tool,
             query_order_tool=self.query_order_tool,
             query_logistics_tool=self.query_logistics_tool,
+            query_after_sale_tool=self.query_after_sale_tool,
+            query_cart_tool=self.query_cart_tool,
+            list_my_orders_tool=self.list_my_orders_tool,
             place_order_tool=self.place_order_tool,
             checkpointer=self.checkpointer,
         )
 
-    def run(self, user_input: str, conversation_id: str = "") -> AgentResponse:
+    def run(self, user_input: str, conversation_id: str = "", user_id: str = "default") -> AgentResponse:
         if not conversation_id:
-            conversation_id = self.conversation_manager.create(user_id="default")
+            conversation_id = self.conversation_manager.create(user_id=user_id)
 
         self.conversation_manager.add_message(conversation_id, "user", user_input)
 
@@ -136,6 +161,7 @@ class MasterAgent:
             "route": "",
             "extract": "",
             "user_query": user_input,
+            "user_id": user_id,
         }
         result = self.graph.invoke(state, config)
 
@@ -149,10 +175,10 @@ class MasterAgent:
         return AgentResponse(type=response_type, content=content,
                              conversation_id=conversation_id)
 
-    async def run_stream(self, user_input: str, conversation_id: str = ""):
+    async def run_stream(self, user_input: str, conversation_id: str = "", user_id: str = "default"):
         """Async generator yielding SSE events per graph node."""
         if not conversation_id:
-            conversation_id = self.conversation_manager.create(user_id="default")
+            conversation_id = self.conversation_manager.create(user_id=user_id)
 
         self.conversation_manager.add_message(conversation_id, "user", user_input)
 
@@ -162,6 +188,7 @@ class MasterAgent:
             "route": "",
             "extract": "",
             "user_query": user_input,
+            "user_id": user_id,
         }
 
         final_content = ""
