@@ -72,6 +72,6 @@ query_after_sale_tool = Tool(
     parameters=[
         ToolParameter("order_id", "string", "关联的订单号", required=False, default=""),
         ToolParameter("ticket_id", "string", "售后工单号", required=False, default=""),
-        ToolParameter("user_id", "string", "当前用户ID", required=False, default=""),
+        ToolParameter("user_id", "string", "当前用户ID（由系统自动注入，无需填写）", required=False, default=""),
     ],
 )

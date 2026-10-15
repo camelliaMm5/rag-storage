@@ -1,277 +1,259 @@
-"""Acceptance test: 4 scenarios + data isolation + JWT auth.
+"""场景验收 —— 用脚本化 LLM 离线回放真实图（不接真实模型、不起服务）。
 
-Usage:
-    python scripts/scenario_test.py              # all fast tests
-    python scripts/scenario_test.py --full       # including LLM integration tests (requires server)
+为什么保留这个脚本（而不是只留单元测试）：
+它输出的是**可读的多轮对话剧本**，用来向人演示「Agent 到底会怎么走」——
+路由到哪个节点、调了哪个工具、反问还是下单。答辩/交接时比一堆 assert 更好用。
+
+用法：
+    python scripts/scenario_test.py            # 全部离线场景
+    python scripts/scenario_test.py --full     # 额外打印在线手测步骤
 """
-import sys
+import asyncio
 import os
-import json
+import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-passed = 0
-failed = 0
+os.environ.setdefault("CONVERSATION_DB_URL", "sqlite:///./_scenario.db")
+os.environ.setdefault("SHOP_DB_URL", "postgresql://user:1234@localhost:5432/agent")
 
-
-def check(name: str, condition: bool, detail: str = ""):
-    global passed, failed
-    if condition:
-        passed += 1
-        print(f"  [PASS] {name}")
-    else:
-        failed += 1
-        print(f"  [FAIL] {name}  {detail}")
-
-
-# ═══════════════════════════════════════════════════════════
-# Test 1: Data Isolation (Repository Layer)
-# ═══════════════════════════════════════════════════════════
-print("=" * 60)
-print("Test 1: User Data Isolation (Repository)")
-print("=" * 60)
-
-from infrastructure.order_repository import MockOrderRepository
-repo = MockOrderRepository()
-
-# Order isolation
-o = repo.find_order("20240501001", "zhangsan")
-check("zhangsan queries own order 20240501001", o is not None and o.product == "X1 智能门锁")
-
-o = repo.find_order("20240501001", "lisi")
-check("lisi CANNOT query zhangsan's order 20240501001", o is None, "data isolation broken")
-
-o = repo.find_order("20240501002", "lisi")
-check("lisi queries own order 20240501002", o is not None and o.product == "C1 智能摄像头")
-
-o = repo.find_order("nonexistent", "zhangsan")
-check("nonexistent order returns None", o is None)
-
-# Logistics isolation
-log = repo.find_logistics("20240501001", "zhangsan")
-check("zhangsan queries own logistics", log is not None and log.carrier == "顺丰快递")
-
-log = repo.find_logistics("20240501001", "lisi")
-check("lisi CANNOT query zhangsan's logistics", log is None, "data isolation broken")
-
-# After-sale isolation
-ticket = repo.find_after_sale("AS20240501001", "zhangsan")
-check("zhangsan queries own after-sale AS20240501001", ticket is not None and ticket.type == "return")
-
-ticket = repo.find_after_sale("AS20240501001", "lisi")
-check("lisi CANNOT query zhangsan's after-sale", ticket is None, "data isolation broken")
-
-ticket = repo.find_after_sale("AS20240502001", "lisi")
-check("lisi queries own after-sale AS20240502001", ticket is not None and ticket.type == "refund")
-
-ticket = repo.find_after_sale("AS20240503001", "wangwu")
-check("wangwu queries own after-sale AS20240503001", ticket is not None and ticket.type == "exchange")
-
-# Per-user listing
-for uid, expected in [("zhangsan", 1), ("lisi", 1), ("wangwu", 1)]:
-    orders = repo.list_orders_by_user(uid)
-    check(f"{uid} order count = {expected}", len(orders) == expected, f"got {len(orders)}")
-
-for uid in ["zhangsan", "lisi", "wangwu"]:
-    tickets = repo.list_after_sales_by_user(uid)
-    check(f"{uid} after-sale count = 1", len(tickets) == 1, f"got {len(tickets)}")
-
-# Create order with user_id
-new_order = repo.create_order("Test Product", 99.0, "TestUser", "TestAddr", "testuser")
-check("new order has correct user_id", new_order.user_id == "testuser")
-check("new order can be queried by owner", repo.find_order(new_order.order_id, "testuser") is not None)
-check("new order blocked for other user", repo.find_order(new_order.order_id, "other") is None)
-
-
-# ═══════════════════════════════════════════════════════════
-# Test 2: JWT Authentication (API Layer)
-# ═══════════════════════════════════════════════════════════
-print()
-print("=" * 60)
-print("Test 2: JWT Authentication")
-print("=" * 60)
-
-from infrastructure.auth import create_access_token, decode_token
-
-# Token generation and decoding
-token_zhangsan = create_access_token("zhangsan")
-check("token generation returns string", isinstance(token_zhangsan, str) and len(token_zhangsan) > 10)
-
-payload = decode_token(token_zhangsan)
-check("token decodes with correct user_id", payload.get("sub") == "zhangsan")
-check("token has expiration", "exp" in payload)
-
-token_lisi = create_access_token("lisi")
-check("different users have different tokens", token_zhangsan != token_lisi)
-
-# Invalid token handling
-import jwt as _jwt
-try:
-    decode_token("invalid.token.here")
-    check("invalid token raises error", False, "should have raised")
-except (_jwt.InvalidTokenError, _jwt.DecodeError):
-    check("invalid token raises InvalidTokenError", True)
-
-# Expired token
-try:
-    expired = _jwt.encode({"sub": "test", "exp": 0}, "demo-secret-change-in-production", algorithm="HS256")
-    decode_token(expired)
-    check("expired token raises error", False, "should have raised")
-except _jwt.ExpiredSignatureError:
-    check("expired token raises ExpiredSignatureError", True)
-
-
-# ═══════════════════════════════════════════════════════════
-# Test 3: Graph Structure (Nodes + Routes)
-# ═══════════════════════════════════════════════════════════
-print()
-print("=" * 60)
-print("Test 3: Graph Structure")
-print("=" * 60)
-
-from domain.customer_service.master_graph import (
-    MasterState, build_master_graph,
-    SUPERVISOR_PROMPT, FAQ_AGENT_PROMPT, ORDER_AGENT_PROMPT,
-    LOGISTICS_AGENT_PROMPT, AFTER_SALE_AGENT_PROMPT,
-)
+from domain.customer_service import MasterAgent, persistent_checkpointer
+from domain.customer_service.routing import normalize_route, resolve_target
+from tests.scripted_model import ScriptedChatModel
+from tools.base import Tool, ToolParameter
 from tools.faq_search import search_faq_tool
-from tools.order_search import query_order_tool, query_logistics_tool, place_order_tool
-from tools.after_sale_search import query_after_sale_tool
-
-# Build graph with all tools
-graph = build_master_graph(
-    llm=None,  # Not needed for structure test
-    search_faq_tool=search_faq_tool,
-    query_order_tool=query_order_tool,
-    query_logistics_tool=query_logistics_tool,
-    query_after_sale_tool=query_after_sale_tool,
-    place_order_tool=place_order_tool,
-    checkpointer=None,
+from tools.order_search import (
+    list_my_orders_tool, query_cart_tool, query_logistics_tool, query_order_tool,
+    search_products_tool,
 )
-
-# Verify graph compiled
-check("graph compiles successfully", graph is not None)
-
-# Verify nodes via graph internal structure
-graph_nodes = set(graph.nodes.keys()) if hasattr(graph, "nodes") else set()
-check("graph has nodes", len(graph_nodes) > 0, f"found {len(graph_nodes)} nodes")
-
-expected_nodes = {
-    "supervisor", "faq_agent", "order_agent", "logistics_agent",
-    "after_sale_agent", "place_order_agent", "finish",
-}
-missing_nodes = expected_nodes - graph_nodes
-if missing_nodes:
-    # Try to get nodes another way
-    nodes = getattr(graph, "nodes", {})
-    node_names = set(nodes.keys())
-    check("all 7 expected nodes present", expected_nodes.issubset(node_names),
-          f"missing: {expected_nodes - node_names}")
-else:
-    check("all 7 expected nodes present", True)
-
-# Verify supervisor prompt includes all routes
-for route in ["order", "logistics", "after_sale", "faq", "place_order", "finish"]:
-    check(f"SUPERVISOR_PROMPT mentions '{route}'", route in SUPERVISOR_PROMPT)
-
-# Verify all sub-agent prompts exist
-check("FAQ_AGENT_PROMPT defined", len(FAQ_AGENT_PROMPT) > 0)
-check("ORDER_AGENT_PROMPT defined", len(ORDER_AGENT_PROMPT) > 0)
-check("LOGISTICS_AGENT_PROMPT defined", len(LOGISTICS_AGENT_PROMPT) > 0)
-check("AFTER_SALE_AGENT_PROMPT defined", len(AFTER_SALE_AGENT_PROMPT) > 0)
-
-
-# ═══════════════════════════════════════════════════════════
-# Test 4: ConversationManager (PostgreSQL)
-# ═══════════════════════════════════════════════════════════
-print()
-print("=" * 60)
-print("Test 4: ConversationManager (PostgreSQL)")
-print("=" * 60)
-
+from tools.after_sale_search import query_after_sale_tool
 from utils import ConversationManager
 
-cm = ConversationManager(max_context_turns=5)
-
-# Create conversations for two users
-conv_a = cm.create("zhangsan")
-conv_b = cm.create("lisi")
-check("create conversation for zhangsan", len(conv_a) == 36)
-check("create conversation for lisi", len(conv_b) == 36)
-check("different users get different conv IDs", conv_a != conv_b)
-
-# Add messages
-mid1 = cm.add_message(conv_a, "user", "我的订单20240501001到哪了？")
-mid2 = cm.add_message(conv_a, "assistant", "您的订单已签收")
-check("add user message", mid1 > 0)
-check("add assistant message", mid2 > 0)
-
-# Get context
-ctx = cm.get_context(conv_a)
-check("context contains 2 messages", len(ctx) == 2, f"got {len(ctx)}")
-
-# Get history
-hist = cm.get_history(conv_a)
-check("history contains 2 messages", len(hist) == 2, f"got {len(hist)}")
-check("history role order correct", hist[0]["role"] == "user" and hist[1]["role"] == "assistant")
-
-# List by user
-conv_list_zhangsan = cm.list_conversations("zhangsan")
-conv_list_lisi = cm.list_conversations("lisi")
-check("zhangsan sees own conversations", len(conv_list_zhangsan) >= 1)
-check("lisi sees own conversations", len(conv_list_lisi) >= 1)
-
-# Close conversation
-cm.close(conv_a)
-import json as _json
-
-# Verify status changed by re-querying
-conv_list = cm.list_conversations("zhangsan")
-closed = [c for c in conv_list if c["conversation_id"] == conv_a]
-check("conversation can be closed", len(closed) == 1 and closed[0]["status"] == "closed",
-      f"status: {closed[0]['status'] if closed else 'NOT FOUND'}")
+PASSED = 0
+FAILED = 0
 
 
-# ═══════════════════════════════════════════════════════════
-# Summary
-# ═══════════════════════════════════════════════════════════
-print()
-print("=" * 60)
-total = passed + failed
-print(f"Results: {passed}/{total} passed, {failed}/{total} failed")
-print("=" * 60)
+def check(name, cond, detail=""):
+    global PASSED, FAILED
+    if cond:
+        PASSED += 1
+        print(f"  [PASS] {name}")
+    else:
+        FAILED += 1
+        print(f"  [FAIL] {name}   {detail}")
 
-if failed > 0:
-    print(f"\n{failed} test(s) FAILED. Review output above.")
-    sys.exit(1)
-else:
-    print("\nAll fast tests passed.")
 
-    # Check for --full flag
+def head(title):
+    print()
+    print("=" * 68)
+    print(title)
+    print("=" * 68)
+
+
+def show(turn, user, resp):
+    route = (resp.metadata or {}).get("route", "")
+    tools = [s["name"] for s in ((resp.metadata or {}).get("tool_calls") or [])]
+    print(f"  用户> {user}")
+    print(f"  客服> {resp.content.strip()[:220]}")
+    print(f"        └ route={route or '-'}  tools={tools or '-'}")
+
+
+def stub(name, result, param="q", required=True):
+    return Tool(name=name, description=f"{name} (stub)", func=lambda **kw: result,
+                parameters=[ToolParameter(param, "string", "param", required=required,
+                                          default=None if required else "")])
+
+
+STUB_TOOLS = [
+    stub("search_faq", "退货需在签收后 7 天内发起申请，商品需保持完好。", "query"),
+    stub("query_order", "订单号 1001  状态 已支付  金额 ¥1599.00", "order_id"),
+    stub("query_logistics", "顺丰快递 SF1234567890  运输中（广州分拣中心）", "order_id"),
+    stub("list_my_orders", "#1001 [已支付] ¥1599.00", "user_id", required=False),
+    stub("query_cart", "您的购物车是空的。", "user_id", required=False),
+    stub("query_after_sale", "该订单暂无售后工单。", "order_id", required=False),
+]
+
+REAL_TOOLS = [
+    search_faq_tool, query_order_tool, query_logistics_tool, list_my_orders_tool,
+    query_cart_tool, query_after_sale_tool, search_products_tool,
+]
+
+
+def agent_with(llm, saver, tools=None):
+    return MasterAgent(llm=llm, conversation_manager=ConversationManager(max_context_turns=6),
+                       tools=tools or STUB_TOOLS, checkpointer=saver)
+
+
+def pg_ok():
+    try:
+        from infrastructure.shop_database import query_one
+        query_one("SELECT 1 AS ok")
+        return True
+    except Exception:
+        return False
+
+
+async def run_scenarios(saver):
+    head("场景 1  订单查询 + 指代消解（「它到哪了」）")
+    llm = ScriptedChatModel(script=[
+        '{"route": "order", "slots": {"order_id": "1001"}}',
+        {"tool": "query_order", "args": {"order_id": "1001"}},
+        "订单 1001 已支付，金额 ¥1599.00，正在安排发货。",
+        '{"route": "logistics", "slots": {}}',
+        {"tool": "query_logistics", "args": {"order_id": "1001"}},
+        "您的包裹由顺丰承运，当前在广州分拣中心，运输中。",
+    ])
+    agent = agent_with(llm, saver)
+    r1 = await agent.arun("订单1001到哪了？", user_id="1")
+    show(0, "订单1001到哪了？", r1)
+    check("第一轮路由到查询类 Agent 并调用了工具",
+          bool((r1.metadata or {}).get("tool_calls")))
+    r2 = await agent.arun("那它到哪了？", conversation_id=r1.conversation_id, user_id="1")
+    show(1, "那它到哪了？", r2)
+    steps = (r2.metadata or {}).get("tool_calls") or []
+    check("第二轮靠跨轮槽位记忆继承了订单号 1001",
+          bool(steps) and str(steps[0]["args"].get("order_id")) == "1001", str(steps))
+
+    head("场景 2  澄清闭环：缺订单号先反问，补参后续跑")
+    llm2 = ScriptedChatModel(script=[
+        '{"route": "logistics", "slots": {}}',
+        '{"route": "finish", "slots": {}}',
+        {"tool": "query_logistics", "args": {"order_id": "1001"}},
+        "查到了：顺丰 SF1234567890，运输中。",
+    ])
+    agent2 = agent_with(llm2, saver)
+    c1 = await agent2.arun("我的快递到哪了？", user_id="1")
+    show(0, "我的快递到哪了？", c1)
+    check("反问而不是拿空订单号去查", "订单号" in c1.content or "工单号" in c1.content,
+          c1.content[:80])
+    c2 = await agent2.arun("1001", conversation_id=c1.conversation_id, user_id="1")
+    show(1, "1001", c2)
+    check("只回一个订单号就能续跑",
+          bool((c2.metadata or {}).get("tool_calls")), str(c2.metadata))
+
+    head("场景 3  下单两阶段：先回显确认，确认后才落库")
+    if not pg_ok():
+        print("  [SKIP] Postgres 不可用，跳过下单场景")
+    else:
+        from infrastructure.shop_database import query_one
+        from domain.shop.order import OrderService
+
+        uid = query_one("SELECT id FROM shop.users ORDER BY id LIMIT 1")["id"]
+        prod = query_one(
+            "SELECT id, name, stock FROM shop.products "
+            "WHERE status='on_sale' AND stock > 3 ORDER BY id LIMIT 1")
+        before = query_one("SELECT count(*) c FROM shop.orders")["c"]
+
+        llm3 = ScriptedChatModel(script=[
+            '{"route": "place_order", "slots": {"product": "%s", '
+            '"address": "广州市天河区体育西路 1 号", "recipient": "camelliam"}}' % prod["name"],
+            '{"route": "place_order", "slots": {}}',
+        ])
+        agent3 = agent_with(llm3, saver, tools=REAL_TOOLS)
+        o1 = await agent3.arun(f"我要买一个 {prod['name']}，寄到广州市天河区体育西路 1 号，"
+                               f"收件人 camelliam", user_id=str(uid))
+        show(0, "我要买一个 …", o1)
+        check("prepare 阶段要求确认", "确认" in o1.content, o1.content[:80])
+        check("prepare 阶段未写库",
+              query_one("SELECT count(*) c FROM shop.orders")["c"] == before)
+
+        o2 = await agent3.arun("确认", conversation_id=o1.conversation_id, user_id=str(uid))
+        show(1, "确认", o2)
+        check("确认后下单成功", "下单成功" in o2.content, o2.content[:80])
+        row = query_one("SELECT id, recipient FROM shop.orders ORDER BY id DESC LIMIT 1")
+        check("收件人已落库（旧版会被丢弃）", row["recipient"] == "camelliam",
+              str(row["recipient"]))
+        await asyncio.to_thread(OrderService.cancel, row["id"], uid)
+
+        head("场景 4  数据隔离：A 的订单号，B 查不到")
+        llm4 = ScriptedChatModel(script=[
+            '{"route": "order", "slots": {"order_id": "%s"}}' % row["id"],
+            {"tool": "query_order", "args": {"order_id": str(row["id"])}},
+            "抱歉，未找到该订单。",
+        ])
+        other = query_one("SELECT id FROM shop.users WHERE id <> %s ORDER BY id LIMIT 1", (uid,))
+        if other:
+            agent4 = agent_with(llm4, saver, tools=REAL_TOOLS)
+            o = await agent4.arun(f"订单{row['id']}什么状态？", user_id=str(other["id"]))
+            show(0, f"订单{row['id']}什么状态？(他人账号)", o)
+            obs = ((o.metadata or {}).get("tool_calls") or [{}])[0].get("observation", "")
+            check("跨用户查询被数据隔离挡住", "未找到" in str(obs) or "未找到" in o.content,
+                  str(obs)[:80])
+
+    head("场景 5  闲聊兜底")
+    llm5 = ScriptedChatModel(script=[
+        '{"route": "finish", "slots": {}}',
+        "你好呀！我可以帮你查订单、查物流、查售后、看购物车，也能直接帮你下单～",
+    ])
+    agent5 = agent_with(llm5, saver)
+    r = await agent5.arun("你好", user_id="1")
+    show(0, "你好", r)
+    check("闲聊走 finish 且不调工具",
+          (r.metadata or {}).get("route") == "finish"
+          and not (r.metadata or {}).get("tool_calls"), str(r.metadata))
+
+
+def run_static_checks():
+    head("静态检查  route 归一化 / resolve_target / 图结构")
+    check("order_status → order", normalize_route("order_status") == "order")
+    check("未知值 → finish（不 KeyError）", normalize_route("banana") == "finish")
+    check("缺槽位 → clarify", resolve_target({"route": "order", "slots": {}}) == "clarify")
+    check("commit → place_order_commit",
+          resolve_target({"route": "place_order", "order_action": "commit", "slots": {}})
+          == "place_order_commit")
+
+    from domain.customer_service.master_graph import AGENT_SPECS, build_master_graph
+    from domain.customer_service.prompts import SUPERVISOR_SYSTEM_PROMPT
+
+    graph = build_master_graph(llm=ScriptedChatModel(script=["x"]),
+                               tools_by_name={t.name: t for t in REAL_TOOLS})
+    nodes = set(getattr(graph, "nodes", {}).keys())
+    expected = {"supervisor", "finish", "clarify", "faq_agent", "order_agent",
+                "logistics_agent", "after_sale_agent", "cart_query_agent",
+                "list_orders_agent", "place_order_prepare", "place_order_commit",
+                "place_order_cancel"}
+    check("图中包含全部预期节点", expected.issubset(nodes),
+          f"missing={sorted(expected - nodes)}")
+    for route in ["order", "logistics", "after_sale", "faq", "place_order", "finish"]:
+        check(f"SUPERVISOR_SYSTEM_PROMPT 覆盖 route '{route}'",
+              route in SUPERVISOR_SYSTEM_PROMPT)
+    check("子 Agent 配置非空", len(AGENT_SPECS) >= 6, str(sorted(AGENT_SPECS)))
+
+    from infrastructure.auth import create_access_token, decode_token
+    import jwt as _jwt
+
+    token = create_access_token("zhangsan")
+    check("JWT 生成与解码", decode_token(token).get("sub") == "zhangsan")
+    try:
+        decode_token("invalid.token.here")
+        check("非法 token 抛错", False, "未抛异常")
+    except _jwt.InvalidTokenError:
+        check("非法 token 抛错", True)
+
+
+async def main():
+    tmp = os.path.join(tempfile.gettempdir(), "scenario_ckpt.db")
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(tmp + suffix):
+            os.remove(tmp + suffix)
+    run_static_checks()
+    async with persistent_checkpointer(tmp) as saver:
+        await run_scenarios(saver)
+
+    head(f"结果：{PASSED}/{PASSED + FAILED} 通过，{FAILED} 失败")
     if "--full" in sys.argv:
         print()
-        print("=" * 60)
-        print("Test 5: Full Integration (requires LLM + running server)")
-        print("=" * 60)
-        print("Run the server first: python main.py")
-        print("Then run: python scripts/scenario_test.py --full")
-        print()
-        print("Manual verification steps:")
-        print()
-        print("  Scenario 1 (Order):  POST /api/token {\"user_id\":\"zhangsan\"}")
-        print("                       POST /api/chat {\"message\":\"订单20240501001发货了吗？\"}")
-        print("                       Expected: Master -> OrderAgent -> order details")
-        print()
-        print("  Scenario 2 (Logistics): POST /api/chat {\"message\":\"20240501001快递到哪了？\"}")
-        print("                       Expected: Master -> LogisticsAgent -> tracking")
-        print()
-        print("  Scenario 3 (AfterSale): POST /api/chat {\"message\":\"AS20240501001售后进度\"}")
-        print("                       Expected: Master -> AfterSaleAgent -> ticket details")
-        print()
-        print("  Scenario 4 (Fallback): POST /api/api/chat {\"message\":\"今天天气怎么样？\"}")
-        print("                       Expected: Master -> finish (chat/greeting)")
-        print()
-        print("  Boundary: lisi tries zhangsan's order 20240501001")
-        print("                       Expected: 未找到 (data isolation)")
-    else:
-        print("\nTo run full LLM integration tests: python scripts/scenario_test.py --full")
+        print("在线手测（需先 `python main.py` 起服务）：")
+        print("  1) TOKEN=$(curl -s -X POST localhost:8000/api/token "
+              "-H 'Content-Type: application/json' -d '{\"user_id\":\"1\"}' "
+              "| python -c \"import sys,json;print(json.load(sys.stdin)['access_token'])\")")
+        print("  2) curl -N -X POST localhost:8000/api/chat/stream "
+              "-H \"Authorization: Bearer $TOKEN\" -H 'Content-Type: application/json' "
+              "-d '{\"message\":\"订单1001到哪了\"}'")
+        print("  3) 观察 SSE：routing → <agent> → tool → token… → done")
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

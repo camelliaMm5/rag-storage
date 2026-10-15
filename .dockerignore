@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 本地运行数据（容器内用 volume 挂载，不打进镜像）
+*.db
+*.db-shm
+*.db-wal
+chroma_db/
+_scenario.db
+
+.env
+.git/
+.gitignore
+.vscode/
+.idea/
+
+docs/*.png
+*.log

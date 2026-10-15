@@ -1,12 +1,48 @@
-"""ProductService — category tree, product listing, search, detail."""
+"""ProductService — category tree, product listing, search, detail.
+
+All three read paths are Cache-Aside cached (namespace ``shop``). They are
+read-mostly and the list endpoint costs a count query + a join, so caching
+pays off. Any stock change (order create / cancel) invalidates the whole
+namespace so callers never see a stale ``stock`` value.
+
+Note on types: ``price`` comes back from psycopg2 as ``Decimal``, which JSON
+cannot represent. ``_jsonable`` normalises Decimal → float *on both paths*
+(hit and miss) so cached and uncached responses have identical types. FastAPI
+already serialises Decimal to a JSON number, so the wire format is unchanged.
+"""
+from decimal import Decimal
+
+from infrastructure.cache import cache, NS_SHOP, TTL_CATEGORY, TTL_PRODUCT
 from infrastructure.shop_database import query_one, query_all
+
+
+def _jsonable(value):
+    """Recursively convert Decimal → float so cached rows round-trip cleanly."""
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
 
 
 class ProductService:
 
     @staticmethod
     def get_category_tree() -> list[dict]:
-        """Return two-level category tree."""
+        """Return two-level category tree (cached — categories change rarely)."""
+        key = cache.key(NS_SHOP, "category", "tree")
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        tree = _jsonable(ProductService._build_category_tree())
+        cache.set(key, tree, TTL_CATEGORY)
+        return tree
+
+    @staticmethod
+    def _build_category_tree() -> list[dict]:
         parents = query_all(
             "SELECT id, name, sort_order FROM shop.categories "
             "WHERE parent_id IS NULL ORDER BY sort_order"
@@ -26,6 +62,20 @@ class ProductService:
     def list_products(category_id: int | None = None, keyword: str = "",
                       page: int = 1, size: int = 20) -> dict:
         """List on_sale products with optional category filter and keyword search."""
+        key = cache.key(NS_SHOP, "list", category_id or 0, keyword or "", page, size)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        result = _jsonable(
+            ProductService._query_products(category_id, keyword, page, size)
+        )
+        cache.set(key, result, TTL_PRODUCT)
+        return result
+
+    @staticmethod
+    def _query_products(category_id: int | None, keyword: str,
+                        page: int, size: int) -> dict:
         conditions = ["p.status = 'on_sale'"]
         params: list = []
 
@@ -70,8 +120,22 @@ class ProductService:
 
     @staticmethod
     def get_product(product_id: int) -> dict | None:
-        """Get product detail by id (including off_sale for admin)."""
-        row = query_one(
+        """Get product detail by id (including off_sale for admin). Cached."""
+        key = cache.key(NS_SHOP, "product", product_id)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        row = ProductService._query_product(product_id)
+        if row is None:
+            return None  # don't cache negative lookups
+        row = _jsonable(row)
+        cache.set(key, row, TTL_PRODUCT)
+        return row
+
+    @staticmethod
+    def _query_product(product_id: int) -> dict | None:
+        return query_one(
             "SELECT p.id, p.name, p.description, p.price, p.image_url, p.stock, "
             "p.category_id, p.status, c.name as category_name "
             "FROM shop.products p "
@@ -79,4 +143,3 @@ class ProductService:
             "WHERE p.id = %s",
             (product_id,),
         )
-        return row

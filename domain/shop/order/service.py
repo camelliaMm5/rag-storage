@@ -1,13 +1,14 @@
 """OrderService — create order (transaction), pay, cancel, query."""
 from datetime import datetime
 
+from infrastructure.cache import cache, NS_SHOP
 from infrastructure.shop_database import get_conn, query_one, query_all
 
 
 class OrderService:
 
     @staticmethod
-    def create(user_id: int, address: str) -> dict:
+    def create(user_id: int, address: str, recipient: str = "") -> dict:
         """Create order from cart. One transaction: lock stock → deduct →
         create order + items → clear cart."""
         if not address:
@@ -15,12 +16,17 @@ class OrderService:
 
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 1. Get cart items
+                # 1. Get cart items —— **必须行锁**。
+                # 旧版这里不加锁：同一用户两个并发结算会各自读到同一批
+                # cart_items，各建一张订单、各扣一次库存（重复下单）。
+                # FOR UPDATE OF ci 锁住购物车行；后到的请求会阻塞，待前者提交
+                # （已 DELETE cart_items）后读到空集 → 得到「购物车为空」，不会重复建单。
                 cur.execute(
                     "SELECT ci.product_id, ci.quantity, p.name, p.price, p.stock "
                     "FROM shop.cart_items ci JOIN shop.products p ON p.id = ci.product_id "
                     "WHERE ci.user_id = %s "
-                    "ORDER BY ci.product_id",
+                    "ORDER BY ci.product_id "
+                    "FOR UPDATE OF ci",
                     (user_id,),
                 )
                 items = cur.fetchall()
@@ -55,9 +61,9 @@ class OrderService:
                 # 4. Create order
                 total = sum(price * qty for _pid, qty, _n, price, _s in items)
                 cur.execute(
-                    "INSERT INTO shop.orders (user_id, total_amount, status, address) "
-                    "VALUES (%s, %s, 'pending', %s) RETURNING id",
-                    (user_id, total, address),
+                    "INSERT INTO shop.orders (user_id, total_amount, status, address, recipient) "
+                    "VALUES (%s, %s, 'pending', %s, %s) RETURNING id",
+                    (user_id, total, address, recipient or None),
                 )
                 order_id = cur.fetchone()[0]
 
@@ -76,7 +82,90 @@ class OrderService:
 
             conn.commit()
 
+        # Stock changed → drop cached product rows / listings
+        cache.invalidate(NS_SHOP)
         return OrderService.get_detail(order_id, user_id)
+
+    @staticmethod
+    def create_direct(user_id: int, product_id: int, quantity: int,
+                      address: str, recipient: str = "") -> dict:
+        """Single-transaction order for AI/natural-language checkout.
+
+        与 create() 的区别：不经过购物车，因此不会污染用户购物车，也不存在
+        「先加购、再下单」两步非原子导致的重复下单窗口。
+        """
+        if not address:
+            raise ValueError("请填写收货地址")
+        if quantity <= 0:
+            raise ValueError("购买数量必须大于 0")
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 行级锁 + 校验（FOR UPDATE 防超卖）
+                cur.execute(
+                    "SELECT id, name, price, stock, status FROM shop.products "
+                    "WHERE id = %s FOR UPDATE",
+                    (product_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise ValueError("商品不存在")
+                pid, name, price, stock, status = row
+                if status != "on_sale":
+                    raise ValueError(f"商品 '{name}' 已下架")
+                if stock < quantity:
+                    raise ValueError(f"商品 '{name}' 库存不足（剩余 {stock}）")
+
+                # 2. 扣库存（带 stock >= qty 二次校验，防并发穿透）
+                cur.execute(
+                    "UPDATE shop.products SET stock = stock - %s "
+                    "WHERE id = %s AND stock >= %s",
+                    (quantity, pid, quantity),
+                )
+                if cur.rowcount == 0:
+                    raise ValueError(f"商品 '{name}' 扣减库存失败，请重试")
+
+                # 3. 建单 + 明细快照
+                total = float(price) * quantity
+                cur.execute(
+                    "INSERT INTO shop.orders (user_id, total_amount, status, address, recipient) "
+                    "VALUES (%s, %s, 'pending', %s, %s) RETURNING id",
+                    (user_id, total, address, recipient or None),
+                )
+                order_id = cur.fetchone()[0]
+                cur.execute(
+                    "INSERT INTO shop.order_items (order_id, product_id, product_name, price, quantity) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (order_id, pid, name, price, quantity),
+                )
+            conn.commit()
+
+        cache.invalidate(NS_SHOP)  # stock changed
+        return OrderService.get_detail(order_id, user_id)
+
+    @staticmethod
+    def cancel_expired(timeout_minutes: int = 30, limit: int = 100) -> list[int]:
+        """Cancel pending orders past the payment window and roll back stock.
+
+        逐单复用 cancel()（各自独立事务），避免长时间持有全局锁。
+        返回被取消的订单 id 列表。
+        """
+        rows = query_all(
+            "SELECT id, user_id FROM shop.orders "
+            "WHERE status = 'pending' "
+            "  AND created_at < NOW() - make_interval(mins => %s) "
+            "ORDER BY created_at LIMIT %s",
+            (timeout_minutes, limit),
+        )
+        cancelled: list[int] = []
+        for r in rows:
+            try:
+                OrderService.cancel(r["id"], r["user_id"])
+                cancelled.append(r["id"])
+            except ValueError:
+                # 例如已被用户支付/取消 —— 说明状态已变，跳过即可
+                continue
+        return cancelled
 
     @staticmethod
     def pay(order_id: int, user_id: int) -> dict:
@@ -160,6 +249,7 @@ class OrderService:
                     )
             conn.commit()
 
+        cache.invalidate(NS_SHOP)  # stock rolled back
         return OrderService.get_detail(order_id, user_id)
 
     @staticmethod
@@ -176,7 +266,7 @@ class OrderService:
         )["cnt"]
         offset = (page - 1) * size
         rows = query_all(
-            f"SELECT o.id, o.total_amount, o.status, o.address, o.created_at, o.paid_at "
+            f"SELECT o.id, o.total_amount, o.status, o.address, o.recipient, o.created_at, o.paid_at "
             f"FROM shop.orders o WHERE {where} "
             f"ORDER BY o.created_at DESC LIMIT %s OFFSET %s",
             tuple(params) + (size, offset),
@@ -186,7 +276,7 @@ class OrderService:
     @staticmethod
     def get_detail(order_id: int, user_id: int) -> dict:
         order = query_one(
-            "SELECT id, user_id, total_amount, status, address, created_at, paid_at, cancelled_at "
+            "SELECT id, user_id, total_amount, status, address, recipient, created_at, paid_at, cancelled_at "
             "FROM shop.orders WHERE id = %s",
             (order_id,),
         )
@@ -216,7 +306,7 @@ class OrderService:
         )["cnt"]
         offset = (page - 1) * size
         rows = query_all(
-            f"SELECT o.id, o.user_id, o.total_amount, o.status, o.address, "
+            f"SELECT o.id, o.user_id, o.total_amount, o.status, o.address, o.recipient, "
             f"o.created_at, o.paid_at, u.nickname "
             f"FROM shop.orders o JOIN shop.users u ON u.id = o.user_id "
             f"WHERE {where} ORDER BY o.created_at DESC "

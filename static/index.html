@@ -108,6 +108,24 @@ a{color:#38bdf8}
 .btn-lg{padding:10px 24px;border-radius:10px;border:none;font-size:0.9rem;font-weight:600;cursor:pointer;background:linear-gradient(135deg,#38bdf8,#818cf8);color:#fff}
 .btn-lg:disabled{opacity:.5;cursor:not-allowed}
 
+/* Toast & Modal —— 替代原生 alert/prompt/confirm。
+   原生弹窗在 Electron/沙箱 iframe（无 allow-modals）里会被**静默屏蔽**：
+   alert 无提示、prompt 直接返回 null，导致「点了按钮没反应」。 */
+.toast-wrap{position:fixed;top:16px;right:16px;z-index:9999;display:flex;flex-direction:column;gap:8px;max-width:min(360px,90vw)}
+.toast{padding:10px 14px;border-radius:10px;background:#1e293b;border:1px solid rgba(148,163,184,0.2);border-left:3px solid #38bdf8;color:#e2e8f0;font-size:0.82rem;line-height:1.55;box-shadow:0 8px 24px rgba(0,0,0,.35);animation:fadeIn .2s;white-space:pre-wrap;word-break:break-word}
+.toast.success{border-left-color:#34d399}
+.toast.error{border-left-color:#f87171}
+.toast.info{border-left-color:#38bdf8}
+.modal-mask{position:fixed;inset:0;background:rgba(2,6,23,.68);z-index:10000;display:flex;align-items:center;justify-content:center;padding:20px}
+.modal-box{background:#1e293b;border:1px solid rgba(148,163,184,0.18);border-radius:14px;padding:18px;width:100%;max-width:400px;box-shadow:0 20px 50px rgba(0,0,0,.5)}
+.modal-box h3{font-size:0.95rem;margin-bottom:10px}
+.modal-box p{font-size:0.82rem;color:#94a3b8;line-height:1.65;margin-bottom:12px;white-space:pre-wrap;word-break:break-word}
+.modal-box input{width:100%;padding:9px 12px;border-radius:9px;border:1px solid rgba(148,163,184,0.25);background:rgba(15,23,42,0.7);color:#e2e8f0;font-size:0.85rem;outline:none;margin-bottom:14px;font-family:inherit}
+.modal-box input:focus{border-color:#38bdf8}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end}
+.modal-actions button{padding:8px 16px;border-radius:9px;font-size:0.82rem;cursor:pointer;border:1px solid rgba(148,163,184,0.2);background:transparent;color:#e2e8f0}
+.modal-actions button.primary{background:linear-gradient(135deg,#38bdf8,#818cf8);border:none;color:#fff;font-weight:600}
+
 @media(max-width:760px){
   .sidebar{display:none}
   .product-grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
@@ -177,7 +195,7 @@ a{color:#38bdf8}
     <div class="list-container" id="cartList"></div>
     <div class="total-bar" id="cartTotal" style="display:none">
       <span>合计: <span class="amount" id="cartAmount"></span></span>
-      <button class="btn-lg" onclick="checkout()">结算下单</button>
+      <button class="btn-lg" onclick="checkout(this)">结算下单</button>
     </div>
   </div>
 
@@ -200,6 +218,8 @@ a{color:#38bdf8}
   </div>
 </div>
 
+<div class="toast-wrap" id="toastWrap"></div>
+
 <script>
 // ═══════════════════════════ State ═══════════════════════════
 let authToken = '';
@@ -215,20 +235,183 @@ function api(path, opts={}) {
   return fetch(path, {...opts, headers});
 }
 
+// ══════════════════ 统一请求层 + 页面内反馈组件 ══════════════════
+// 为什么不用原生 alert/prompt/confirm：
+// 在 Electron 内嵌 webview / 沙箱 iframe（sandbox 未开 allow-modals）里，
+// 浏览器会**静默屏蔽**这三个 API —— alert 不弹、prompt 直接返回 null。
+// 旧版 checkout() 用 prompt 收地址，`if (!addr) return;` 于是让「结算下单」
+// 变成一个点了毫无反应的死按钮；支付成功也因为没有 alert 而看不到反馈。
+//
+// 旧版还有个更隐蔽的问题：所有数据加载都是 `catch(e){}` **静默吞异常**。
+// token 过期（JWT_EXPIRE_MINUTES=60）后接口全返 401，页面却毫无提示，
+// 表现就是「购物车空的 / 结算按钮不见了 / 点了没反应」。
+
+/** 后端错误信息透传：业务失败走 {message}，FastAPI 走 {detail}（可能是数组）。 */
+function msgOf(d) {
+  if (!d) return '';
+  let m = d.message || d.detail;
+  if (Array.isArray(m)) m = m.map(x => (x && (x.msg || x.detail)) || JSON.stringify(x)).join('；');
+  if (m && typeof m === 'object') m = JSON.stringify(m);
+  return m ? String(m) : '';
+}
+
+/** 页面内轻提示（右上角浮层）。type: info | success | error */
+function toast(msg, type) {
+  const wrap = document.getElementById('toastWrap');
+  if (!wrap) return;
+  const el = document.createElement('div');
+  el.className = 'toast ' + (type || 'info');
+  el.textContent = msg;
+  wrap.appendChild(el);
+  const ttl = (type === 'error') ? 7000 : 3500;
+  setTimeout(() => {
+    el.style.transition = 'opacity .3s';
+    el.style.opacity = '0';
+    setTimeout(() => el.remove(), 320);
+  }, ttl);
+}
+
+/** 页面内文本输入框（Promise 化），替代 prompt。取消/回车空值 → null。 */
+function askText(title, defaultValue, placeholder) {
+  return new Promise(resolve => {
+    const mask = document.createElement('div');
+    mask.className = 'modal-mask';
+    mask.innerHTML =
+      '<div class="modal-box"><h3>' + esc(title) + '</h3>'
+      + '<input type="text" id="__askInput">'
+      + '<div class="modal-actions"><button id="__askCancel">取消</button>'
+      + '<button class="primary" id="__askOk">确定</button></div></div>';
+    document.body.appendChild(mask);
+    const input = mask.querySelector('#__askInput');
+    input.value = defaultValue || '';
+    if (placeholder) input.placeholder = placeholder;
+    input.focus();
+    input.select();
+    let settled = false;
+    function done(val) { if (settled) return; settled = true; mask.remove(); resolve(val); }
+    mask.querySelector('#__askOk').onclick = () => done(input.value.trim());
+    mask.querySelector('#__askCancel').onclick = () => done(null);
+    mask.onclick = e => { if (e.target === mask) done(null); };
+    input.onkeydown = e => {
+      if (e.key === 'Enter') { e.preventDefault(); done(input.value.trim()); }
+      else if (e.key === 'Escape') { e.preventDefault(); done(null); }
+    };
+  });
+}
+
+/** 页面内确认框（Promise 化），替代 confirm。 */
+function askConfirm(title, message) {
+  return new Promise(resolve => {
+    const mask = document.createElement('div');
+    mask.className = 'modal-mask';
+    mask.innerHTML =
+      '<div class="modal-box"><h3>' + esc(title) + '</h3>'
+      + '<p>' + esc(message || '') + '</p>'
+      + '<div class="modal-actions"><button id="__cfNo">取消</button>'
+      + '<button class="primary" id="__cfYes">确定</button></div></div>';
+    document.body.appendChild(mask);
+    let settled = false;
+    function done(v) { if (settled) return; settled = true; mask.remove(); resolve(v); }
+    mask.querySelector('#__cfYes').onclick = () => done(true);
+    mask.querySelector('#__cfNo').onclick = () => done(false);
+    mask.onclick = e => { if (e.target === mask) done(false); };
+  });
+}
+
+/** 页面内信息展示框（单按钮），替代 alert 展示多行详情。 */
+function showInfo(title, message) {
+  return new Promise(resolve => {
+    const mask = document.createElement('div');
+    mask.className = 'modal-mask';
+    mask.innerHTML =
+      '<div class="modal-box"><h3>' + esc(title) + '</h3>'
+      + '<p>' + esc(message || '') + '</p>'
+      + '<div class="modal-actions"><button class="primary" id="__okBtn">知道了</button></div></div>';
+    document.body.appendChild(mask);
+    let settled = false;
+    function done() { if (settled) return; settled = true; mask.remove(); resolve(true); }
+    mask.querySelector('#__okBtn').onclick = done;
+    mask.onclick = e => { if (e.target === mask) done(); };
+  });
+}
+
+let _authExpiredNotified = false;
+/** 登录态失效（401）：清身份 + 提示，避免用户在「看起来已登录」的界面上白点。 */
+function onAuthExpired() {
+  authToken = ''; currentUser = null; currentConvId = '';
+  const la = document.getElementById('loginArea');
+  const ua = document.getElementById('userInfoArea');
+  if (la) la.style.display = 'block';
+  if (ua) ua.style.display = 'none';
+  document.querySelectorAll('.admin-only').forEach(e => e.style.display = 'none');
+  const badge = document.getElementById('cartBadge');
+  if (badge) badge.style.display = 'none';
+  const total = document.getElementById('cartTotal');
+  if (total) total.style.display = 'none';
+  if (!_authExpiredNotified) {
+    _authExpiredNotified = true;
+    toast('登录已过期（默认 60 分钟），请重新登录后再操作', 'error');
+    setTimeout(() => { _authExpiredNotified = false; }, 4000);
+  }
+}
+
+/** 统一请求：解析 JSON + 透传错误原因 + 401 触发重新登录。
+ *  失败一律 throw Error(可读原因)，调用方 catch 后用 toast 展示。 */
+async function req(path, opts={}) {
+  // skipAuthRedirect：登录/注册接口自身的 401 是「账号密码错误」，不是登录过期
+  const skipAuthRedirect = !!opts.skipAuthRedirect;
+  const fetchOpts = {...opts};
+  delete fetchOpts.skipAuthRedirect;
+  let r;
+  try {
+    r = await api(path, fetchOpts);
+  } catch (e) {
+    throw new Error('网络请求失败，请确认服务已启动（' + (e && e.message ? e.message : '连接被拒绝') + '）');
+  }
+  if (r.status === 401 && !skipAuthRedirect) { onAuthExpired(); throw new Error('登录已过期，请重新登录'); }
+
+  let data = null;
+  const raw = await r.text();
+  if (raw) { try { data = JSON.parse(raw); } catch (e) { data = null; } }
+
+  if (!r.ok) throw new Error(msgOf(data) || ('请求失败 (HTTP ' + r.status + ')'));
+  if (data && data.code !== undefined && data.code !== 0) {
+    throw new Error(msgOf(data) || '操作失败');
+  }
+  return data || {};
+}
+
+/** 按钮忙碌态：防重复提交（结算/支付最容易连点出重复单）。 */
+async function withBusy(btn, label, fn) {
+  if (!btn) return fn();
+  if (btn.dataset.busy === '1') return;
+  btn.dataset.busy = '1';
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = label || '处理中...';
+  try {
+    return await fn();
+  } finally {
+    btn.dataset.busy = '';
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+}
+
 // ═══════════════════════════ Auth ═══════════════════════════
 async function doLogin() {
   const email = document.getElementById('loginEmail').value.trim();
   const pass = document.getElementById('loginPass').value.trim();
-  if (!email || !pass) { alert('请输入邮箱和密码'); return; }
+  if (!email || !pass) { toast('请输入邮箱和密码', 'error'); return; }
   try {
-    const r = await fetch('/api/shop/auth/login', {
-      method:'POST', headers:{'Content-Type':'application/json'},
+    const d = await req('/api/shop/auth/login', {
+      method:'POST',
+      skipAuthRedirect: true,
       body:JSON.stringify({email, password: pass})
     });
-    const d = await r.json();
-    if (d.code !== 0) { alert('登录失败: ' + (d.message || d.detail)); return; }
     authToken = d.data.access_token;
     currentUser = d.data.user;
+    _authExpiredNotified = false;
     document.getElementById('loginArea').style.display = 'none';
     document.getElementById('userInfoArea').style.display = 'block';
     document.getElementById('userDisplay').textContent = currentUser.nickname || currentUser.email;
@@ -236,39 +419,45 @@ async function doLogin() {
     if (currentUser.role === 'admin') {
       document.querySelectorAll('.admin-only').forEach(e => e.style.display = '');
     }
+    toast('登录成功，欢迎回来 ' + (currentUser.nickname || currentUser.email), 'success');
     await loadConversations();
     loadCartBadge();
-  } catch(e) { alert('登录失败: ' + e.message); }
+  } catch(e) { toast('登录失败：' + e.message, 'error'); }
 }
 
 async function doRegister() {
   const email = document.getElementById('loginEmail').value.trim();
   const pass = document.getElementById('loginPass').value.trim();
-  if (!email || !pass) { alert('请输入邮箱和密码'); return; }
-  if (pass.length < 6) { alert('密码至少6位'); return; }
+  if (!email || !pass) { toast('请输入邮箱和密码', 'error'); return; }
+  if (pass.length < 6) { toast('密码至少 6 位', 'error'); return; }
   try {
-    const r = await fetch('/api/shop/auth/register', {
-      method:'POST', headers:{'Content-Type':'application/json'},
+    await req('/api/shop/auth/register', {
+      method:'POST',
+      skipAuthRedirect: true,
       body:JSON.stringify({email, password: pass, nickname: email.split('@')[0]})
     });
-    const d = await r.json();
-    if (d.code !== 0) { alert('注册失败: ' + (d.message || d.detail)); return; }
-    alert('注册成功，请登录');
+    toast('注册成功，请登录', 'success');
     document.getElementById('loginPass').value = '';
-  } catch(e) { alert('注册失败: ' + e.message); }
+  } catch(e) { toast('注册失败：' + e.message, 'error'); }
 }
 
 function doLogout() {
   authToken = ''; currentUser = null; currentConvId = '';
+  _authExpiredNotified = false;
   document.getElementById('loginArea').style.display = 'block';
   document.getElementById('userInfoArea').style.display = 'none';
   document.querySelectorAll('.admin-only').forEach(e => e.style.display = 'none');
+  const badge = document.getElementById('cartBadge');
+  if (badge) badge.style.display = 'none';
+  const total = document.getElementById('cartTotal');
+  if (total) total.style.display = 'none';
   document.getElementById('chatMessages').innerHTML = '<div class="empty-state"><div class="icon">&#129302;</div><div>请先登录</div></div>';
+  toast('已退出登录', 'info');
 }
 
 // ═══════════════════════════ Panel ═══════════════════════════
 function switchPanel(name) {
-  if (!authToken && name !== 'chat') { alert('请先登录'); return; }
+  if (!authToken && name !== 'chat') { toast('请先登录再使用该功能', 'error'); return; }
   currentPanel = name;
   document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active'));
   document.querySelector('.nav-item[data-panel="' + name + '"]')?.classList.add('active');
@@ -300,14 +489,13 @@ async function loadCategories() {
 }
 
 async function loadProducts() {
-  if (!authToken) { alert('请先登录'); return; }
+  if (!authToken) { toast('请先登录再浏览商品', 'error'); return; }
   var kw = document.getElementById('searchInput')?.value || '';
   var url = '/api/shop/products?page=1&size=50';
   if (currentCategoryId) url += '&category_id=' + currentCategoryId;
   if (kw) url += '&keyword=' + encodeURIComponent(kw);
   try {
-    const r = await api(url);
-    const d = await r.json();
+    const d = await req(url);
     const items = d.data?.items || [];
     var html = '';
     items.forEach(function(p) {
@@ -319,95 +507,123 @@ async function loadProducts() {
         + '<div class="pdesc">' + esc(p.description || '') + '</div>'
         + '<div class="pprice' + noStock + '">¥' + p.price + '</div>'
         + '<div class="pstock' + noStock + '">库存: ' + p.stock + '</div>'
-        + '<button class="add-cart-btn" onclick="addToCart(' + p.id + ')" ' + (p.status !== 'on_sale' || p.stock <= 0 ? 'disabled' : '') + '>'
+        + '<button class="add-cart-btn" onclick="addToCart(' + p.id + ', this)" ' + (p.status !== 'on_sale' || p.stock <= 0 ? 'disabled' : '') + '>'
         + (p.stock <= 0 ? '缺货' : (p.status !== 'on_sale' ? '已下架' : '加入购物车'))
         + '</button></div>';
     });
     document.getElementById('productGrid').innerHTML = html || '<div class="empty-state"><div class="icon">&#128722;</div><div>暂无商品</div></div>';
-  } catch(e) {}
+  } catch(e) {
+    toast('商品加载失败：' + e.message, 'error');
+  }
 }
 
 // ═══════════════════════════ Cart ═══════════════════════════
-async function addToCart(pid) {
+async function addToCart(pid, btn) {
   try {
-    const r = await api('/api/shop/cart', {method:'POST', body:JSON.stringify({product_id:pid, quantity:1})});
-    const d = await r.json();
-    if (d.code === 0) { loadCartBadge(); alert('已加入购物车'); }
-    else { alert(d.message || '操作失败'); }
-  } catch(e) { alert('操作失败: ' + e.message); }
+    await withBusy(btn, '加入中...', async () => {
+      await req('/api/shop/cart', {method:'POST', body:JSON.stringify({product_id:pid, quantity:1})});
+    });
+    toast('已加入购物车', 'success');
+    await loadCartBadge();
+    if (currentPanel === 'cart') loadCart();
+  } catch(e) { toast('加入购物车失败：' + e.message, 'error'); }
 }
 
 async function loadCart() {
   try {
-    const r = await api('/api/shop/cart');
-    const d = await r.json();
+    const d = await req('/api/shop/cart');
     const items = d.data?.items || [];
-    const total = d.data?.total_amount || 0;
+    const total = Number(d.data?.total_amount || 0);
     var html = '';
     if (items.length === 0) {
       html = '<div class="empty-state"><div class="icon">&#128717;</div><div>购物车为空</div></div>';
     }
     items.forEach(function(it) {
+      const qty = Number(it.quantity) || 1;
       html += '<div class="list-item">'
-        + '<div class="info"><div class="title">' + esc(it.product_name) + '</div><div class="price">¥' + it.price + ' x' + it.quantity + '</div></div>'
+        + '<div class="info"><div class="title">' + esc(it.product_name) + '</div><div class="price">¥' + it.price + ' x' + qty + '</div></div>'
         + '<div class="quant-ctrl">'
-        + '<button onclick="updateCartQty(' + it.product_id + ',' + (it.quantity - 1) + ')">-</button>'
-        + '<span>' + it.quantity + '</span>'
-        + '<button onclick="updateCartQty(' + it.product_id + ',' + (it.quantity + 1) + ')">+</button>'
+        + '<button onclick="updateCartQty(' + it.product_id + ',' + (qty - 1) + ')">-</button>'
+        + '<span>' + qty + '</span>'
+        + '<button onclick="updateCartQty(' + it.product_id + ',' + (qty + 1) + ')">+</button>'
         + '</div>'
         + '<button class="btn-sm danger" onclick="removeFromCart(' + it.product_id + ')">删除</button>'
         + '</div>';
     });
     document.getElementById('cartList').innerHTML = html;
+    const bar = document.getElementById('cartTotal');
     if (items.length > 0) {
-      document.getElementById('cartTotal').style.display = 'flex';
+      bar.style.display = 'flex';
       document.getElementById('cartAmount').textContent = '¥' + total.toFixed(2);
     } else {
-      document.getElementById('cartTotal').style.display = 'none';
+      bar.style.display = 'none';
     }
     loadCartBadge();
-  } catch(e) {}
+  } catch(e) {
+    // 不再静默吞异常 —— 登录过期 / 服务异常都要让用户看见，并给出重试入口
+    document.getElementById('cartTotal').style.display = 'none';
+    document.getElementById('cartList').innerHTML =
+      '<div class="empty-state"><div class="icon">&#9888;</div><div>' + esc(e.message) + '</div>'
+      + '<div style="margin-top:12px"><button class="btn-sm" onclick="loadCart()">重新加载</button></div></div>';
+    toast('购物车加载失败：' + e.message, 'error');
+  }
 }
 
 async function updateCartQty(pid, qty) {
   if (qty <= 0) { removeFromCart(pid); return; }
-  await api('/api/shop/cart/' + pid + '?quantity=' + qty, {method:'PUT'});
-  loadCart();
+  try {
+    await req('/api/shop/cart/' + pid + '?quantity=' + qty, {method:'PUT'});
+    loadCart();
+  } catch(e) { toast('修改数量失败：' + e.message, 'error'); }
 }
 
 async function removeFromCart(pid) {
-  await api('/api/shop/cart/' + pid, {method:'DELETE'});
-  loadCart();
+  try {
+    await req('/api/shop/cart/' + pid, {method:'DELETE'});
+    toast('已从购物车移除', 'success');
+    loadCart();
+  } catch(e) { toast('移除失败：' + e.message, 'error'); }
 }
 
 async function loadCartBadge() {
+  const badge = document.getElementById('cartBadge');
+  if (!authToken) { if (badge) badge.style.display = 'none'; return; }
   try {
-    const r = await api('/api/shop/cart');
-    const d = await r.json();
-    const count = (d.data?.items || []).reduce(function(s, i) { return s + i.quantity; }, 0);
-    const badge = document.getElementById('cartBadge');
+    const d = await req('/api/shop/cart');
+    const count = (d.data?.items || []).reduce(function(s, i) { return s + (Number(i.quantity) || 0); }, 0);
     if (count > 0) { badge.style.display = ''; badge.textContent = count; }
     else { badge.style.display = 'none'; }
-  } catch(e) {}
+  } catch(e) {
+    // 徽标属非关键展示，失败静默；真实错误由 loadCart() 呈现给用户
+    if (badge) badge.style.display = 'none';
+  }
 }
 
-async function checkout() {
-  if (!currentUser) return;
-  var addr = prompt('请输入收货地址：', currentUser.role === 'user' ? '默认地址' : '');
-  if (!addr) return;
+async function checkout(btn) {
+  if (!currentUser) { toast('请先登录再结算', 'error'); return; }
+  // 用页面内输入框收地址（原生 prompt 在嵌入/沙箱环境会被静默屏蔽 → 点了没反应）
+  const addr = await askText('填写收货地址', currentUser.role === 'user' ? '默认地址' : '',
+                             '例如：广东省深圳市南山区科技园1号');
+  if (addr === null) { toast('已取消结算', 'info'); return; }
+  if (!addr) { toast('收货地址不能为空', 'error'); return; }
+
   try {
-    const r = await api('/api/shop/orders', {method:'POST', body:JSON.stringify({address: addr})});
-    const d = await r.json();
-    if (d.code === 0) { alert('下单成功！订单号: ' + d.data.id); loadCart(); switchPanel('orders'); }
-    else { alert(d.message || '下单失败'); }
-  } catch(e) { alert('下单失败: ' + e.message); }
+    await withBusy(btn, '提交中...', async () => {
+      const d = await req('/api/shop/orders', {method:'POST', body:JSON.stringify({address: addr})});
+      const order = d.data || {};
+      toast('下单成功！订单号 ' + order.id + '，合计 ¥' + order.total_amount, 'success');
+      await loadCart();
+      switchPanel('orders');
+    });
+  } catch(e) {
+    toast('下单失败：' + e.message, 'error');
+  }
 }
 
 // ═══════════════════════════ Orders ═══════════════════════════
 async function loadOrders() {
   try {
-    const r = await api('/api/shop/orders');
-    const d = await r.json();
+    const d = await req('/api/shop/orders');
     const items = d.data?.items || [];
     if (items.length === 0) {
       document.getElementById('orderList').innerHTML = '<div class="empty-state"><div class="icon">&#128196;</div><div>暂无订单</div></div>';
@@ -419,51 +635,59 @@ async function loadOrders() {
         + '<div class="info"><div class="title">订单 #' + o.id + ' <span class="status-badge ' + o.status + '">' + statusLabel(o.status) + '</span></div>'
         + '<div class="sub">' + timeStr(o.created_at) + '</div><div class="price">¥' + o.total_amount + '</div></div>'
         + '<div class="actions">'
-        + (o.status === 'pending' ? '<button class="btn-sm primary" onclick="payOrder(' + o.id + ')">支付</button><button class="btn-sm danger" onclick="cancelOrder(' + o.id + ')">取消</button>' : '')
+        + (o.status === 'pending' ? '<button class="btn-sm primary" onclick="payOrder(' + o.id + ', this)">支付</button><button class="btn-sm danger" onclick="cancelOrder(' + o.id + ', this)">取消</button>' : '')
         + '<button class="btn-sm" onclick="viewOrder(' + o.id + ')">详情</button></div></div>';
     });
     document.getElementById('orderList').innerHTML = html;
-  } catch(e) {}
+  } catch(e) {
+    document.getElementById('orderList').innerHTML =
+      '<div class="empty-state"><div class="icon">&#9888;</div><div>' + esc(e.message) + '</div>'
+      + '<div style="margin-top:12px"><button class="btn-sm" onclick="loadOrders()">重新加载</button></div></div>';
+    toast('订单加载失败：' + e.message, 'error');
+  }
 }
 
-async function payOrder(oid) {
+async function payOrder(oid, btn) {
   try {
-    const r = await api('/api/shop/orders/' + oid + '/pay', {method:'POST'});
-    const d = await r.json();
-    if (d.code === 0) { alert('支付成功'); loadOrders(); }
-    else { alert(d.message || '支付失败'); }
-  } catch(e) { alert('支付失败: ' + e.message); }
+    await withBusy(btn, '支付中...', async () => {
+      const d = await req('/api/shop/orders/' + oid + '/pay', {method:'POST'});
+      const o = d.data || {};
+      toast('支付成功：订单 #' + (o.id || oid) + ' 已支付', 'success');
+      await loadOrders();
+    });
+  } catch(e) { toast('支付失败：' + e.message, 'error'); }
 }
 
-async function cancelOrder(oid) {
-  if (!confirm('确认取消该订单？')) return;
+async function cancelOrder(oid, btn) {
+  const ok = await askConfirm('取消订单', '确认取消订单 #' + oid + ' 吗？取消后库存会退回。');
+  if (!ok) return;
   try {
-    const r = await api('/api/shop/orders/' + oid + '/cancel', {method:'POST'});
-    const d = await r.json();
-    if (d.code === 0) { alert('已取消'); loadOrders(); }
-    else { alert(d.message || '取消失败'); }
-  } catch(e) { alert('取消失败: ' + e.message); }
+    await withBusy(btn, '取消中...', async () => {
+      await req('/api/shop/orders/' + oid + '/cancel', {method:'POST'});
+      toast('订单 #' + oid + ' 已取消', 'success');
+      await loadOrders();
+    });
+  } catch(e) { toast('取消失败：' + e.message, 'error'); }
 }
 
 async function viewOrder(oid) {
   try {
-    const r = await api('/api/shop/orders/' + oid);
-    const d = await r.json();
-    const o = d.data;
-    var detail = '订单 #' + o.id + '\n状态: ' + statusLabel(o.status) + '\n金额: ¥' + o.total_amount + '\n地址: ' + o.address + '\n时间: ' + timeStr(o.created_at);
-    if (o.items) {
+    const d = await req('/api/shop/orders/' + oid);
+    const o = d.data || {};
+    var detail = '状态: ' + statusLabel(o.status) + '\n金额: ¥' + o.total_amount
+      + '\n地址: ' + (o.address || '-') + '\n时间: ' + timeStr(o.created_at);
+    if (o.items && o.items.length) {
       detail += '\n\n商品明细:';
-      o.items.forEach(function(i) { detail += '\n  ' + i.product_name + ' x' + i.quantity + ' ¥' + i.price; });
+      o.items.forEach(function(i) { detail += '\n  ' + i.product_name + ' x' + i.quantity + '  ¥' + i.price; });
     }
-    alert(detail);
-  } catch(e) {}
+    await showInfo('订单 #' + (o.id || oid), detail);
+  } catch(e) { toast('详情加载失败：' + e.message, 'error'); }
 }
 
 // ═══════════════════════════ AfterSale ═══════════════════════════
 async function loadAfterSales() {
   try {
-    const r = await api('/api/shop/after-sales');
-    const d = await r.json();
+    const d = await req('/api/shop/after-sales');
     const items = d.data || [];
     if (items.length === 0) {
       document.getElementById('afterSaleList').innerHTML = '<div class="empty-state"><div class="icon">&#128220;</div><div>暂无售后记录</div></div>';
@@ -478,7 +702,12 @@ async function loadAfterSales() {
         + '<div class="sub">' + timeStr(as.created_at) + '</div></div></div>';
     });
     document.getElementById('afterSaleList').innerHTML = html;
-  } catch(e) {}
+  } catch(e) {
+    document.getElementById('afterSaleList').innerHTML =
+      '<div class="empty-state"><div class="icon">&#9888;</div><div>' + esc(e.message) + '</div>'
+      + '<div style="margin-top:12px"><button class="btn-sm" onclick="loadAfterSales()">重新加载</button></div></div>';
+    toast('售后记录加载失败：' + e.message, 'error');
+  }
 }
 
 // ═══════════════════════════ Admin ═══════════════════════════
@@ -489,48 +718,50 @@ async function loadAdmin() {
   }
   try {
     var html = '<h3 style="margin-bottom:12px;font-size:0.9rem">全部订单</h3>';
-    const r = await api('/api/shop/admin/orders?size=30');
-    const d = await r.json();
+    const d = await req('/api/shop/admin/orders?size=30');
     (d.data?.items || []).forEach(function(o) {
       html += '<div class="list-item"><div class="info"><div class="title">#' + o.id + ' | ' + esc(o.nickname) + ' <span class="status-badge ' + o.status + '">' + statusLabel(o.status) + '</span></div><div class="price">¥' + o.total_amount + '</div></div></div>';
     });
 
     html += '<h3 style="margin:16px 0 8px;font-size:0.9rem">全部商品</h3>';
-    const pr = await api('/api/shop/products?size=50');
-    const pd = await pr.json();
+    const pd = await req('/api/shop/products?size=50');
     (pd.data?.items || []).forEach(function(p) {
       html += '<div class="list-item"><div class="info"><div class="title">[' + p.id + '] ' + esc(p.name) + ' <span class="status-badge ' + p.status + '">' + p.status + '</span></div><div class="sub">¥' + p.price + ' | 库存: ' + p.stock + '</div></div><button class="btn-sm" onclick="toggleProduct(' + p.id + ',\'' + (p.status === 'on_sale' ? 'off_sale' : 'on_sale') + '\')">' + (p.status === 'on_sale' ? '下架' : '上架') + '</button></div>';
     });
     document.getElementById('adminContent').innerHTML = html;
-  } catch(e) {}
+  } catch(e) {
+    document.getElementById('adminContent').innerHTML =
+      '<div class="empty-state"><div class="icon">&#9888;</div><div>' + esc(e.message) + '</div>'
+      + '<div style="margin-top:12px"><button class="btn-sm" onclick="loadAdmin()">重新加载</button></div></div>';
+    toast('后台加载失败：' + e.message, 'error');
+  }
 }
 
 async function toggleProduct(pid, newStatus) {
   try {
-    const r = await api('/api/shop/admin/products/' + pid + '/status?status=' + newStatus, {method:'PUT'});
-    const d = await r.json();
-    if (d.code === 0) { loadAdmin(); } else { alert(d.message); }
-  } catch(e) {}
+    await req('/api/shop/admin/products/' + pid + '/status?status=' + newStatus, {method:'PUT'});
+    toast('已' + (newStatus === 'on_sale' ? '上架' : '下架'), 'success');
+    loadAdmin();
+  } catch(e) { toast('操作失败：' + e.message, 'error'); }
 }
 
 // ═══════════════════════════ AI Chat ═══════════════════════════
 async function loadConversations() {
+  if (!authToken) return;
   try {
-    const r = await api('/api/conversations');
-    const convs = await r.json();
+    const convs = await req('/api/conversations');
     if (Array.isArray(convs) && convs.length > 0) {
       currentConvId = convs[0].conversation_id;
     }
-  } catch(e) {}
+  } catch(e) { /* 会话列表属非关键路径，失败静默，不打扰用户 */ }
 }
 
 async function newConversation() {
   try {
-    const r = await api('/api/conversations', {method:'POST'});
-    const d = await r.json();
+    const d = await req('/api/conversations', {method:'POST'});
     currentConvId = d.conversation_id;
     document.getElementById('chatMessages').innerHTML = '<div class="empty-state"><div class="icon">&#129302;</div><div>开始新对话</div></div>';
-  } catch(e) {}
+  } catch(e) { toast('新建对话失败：' + e.message, 'error'); }
 }
 
 function handleKey(e) {
@@ -552,6 +783,30 @@ async function sendMessage() {
   scrollDown();
 
   var currentRoute = '';
+  var streamTextEl = null;
+  var streamBuf = '';
+  var gotToken = false;
+
+  function ensureStreamBubble() {
+    if (streamTextEl) return streamTextEl;
+    var wrap = document.createElement('div');
+    wrap.className = 'msg assistant';
+    wrap.innerHTML = '<div class="avatar">AI</div><div class="bubble">'
+      + '<span class="type-tag ' + (currentRoute || 'greeting') + '">'
+      + routeLabel(currentRoute) + '</span><div class="stream-text"></div></div>';
+    chatMsgs.appendChild(wrap);
+    streamTextEl = wrap.querySelector('.stream-text');
+    if (progressDiv.parentNode) progressDiv.remove();
+    return streamTextEl;
+  }
+
+  function appendToken(t) {
+    if (!t) return;
+    ensureStreamBubble();
+    streamBuf += t;
+    streamTextEl.innerHTML = esc(streamBuf);
+    scrollDown();
+  }
 
   try {
     const resp = await api('/api/chat/stream', {
@@ -573,18 +828,41 @@ async function sendMessage() {
         if (!line.startsWith('data: ')) continue;
         try {
           const evt = JSON.parse(line.slice(6));
-          handleSSE(evt, progressDiv);
-          if (evt.event === 'routing') currentRoute = evt.route;
+          if (evt.event === 'routing' && evt.route) currentRoute = evt.route;
+          if (evt.event === 'token') { gotToken = true; appendToken(evt.content); continue; }
+          if (evt.event === 'agent_result') {
+            // 已经流式输出过就不重复渲染
+            if (!gotToken) { streamBuf = evt.content || streamBuf; }
+            continue;
+          }
+          if (evt.event === 'done') {
+            if (evt.route) currentRoute = evt.route;
+            continue;
+          }
+          handleSSE(evt, progressDiv, currentRoute);
           if (evt.conversation_id && !currentConvId) currentConvId = evt.conversation_id;
         } catch(e) {}
       }
     }
-    progressDiv.classList.add('done');
-    progressDiv.querySelector('span').textContent = currentRoute ? '已完成 (' + routeLabel(currentRoute) + ')' : '已完成';
-    progressDiv.querySelector('.pdot').style.animation = 'none';
-    progressDiv.querySelector('.pdot').style.background = '#34d399';
+
+    if (gotToken) {
+      // 收尾：按最终路由补一次标签
+      if (streamTextEl) {
+        var wrap = streamTextEl.closest('.bubble');
+        var tag = wrap && wrap.querySelector('.type-tag');
+        if (tag) { tag.textContent = routeLabel(currentRoute); tag.className = 'type-tag ' + (currentRoute || 'greeting'); }
+      }
+      if (progressDiv.parentNode) progressDiv.remove();
+    } else {
+      progressDiv.classList.add('done');
+      progressDiv.querySelector('span').textContent = currentRoute ? '已完成 (' + routeLabel(currentRoute) + ')' : '已完成';
+      progressDiv.querySelector('.pdot').style.animation = 'none';
+      progressDiv.querySelector('.pdot').style.background = '#34d399';
+      if (streamBuf) addResultBubble(streamBuf, currentRoute);
+      else if (progressDiv.parentNode) progressDiv.remove();
+    }
   } catch(e) {
-    progressDiv.remove();
+    if (progressDiv.parentNode) progressDiv.remove();
     addBubble('assistant', '请求失败: ' + e.message);
   } finally {
     document.getElementById('sendBtn').disabled = false;
@@ -592,18 +870,29 @@ async function sendMessage() {
   }
 }
 
-function handleSSE(evt, progressDiv) {
+function handleSSE(evt, progressDiv, currentRoute) {
   const span = progressDiv.querySelector('span');
+  if (!span) return;
   switch (evt.event) {
+    case 'supervisor': span.textContent = '正在分析意图...'; break;
     case 'routing': span.innerHTML = '已路由到: ' + routeLabel(evt.route); break;
     case 'faq_agent': span.textContent = 'FAQ Agent 检索知识库中...'; break;
     case 'order_agent': span.textContent = '订单 Agent 查询中...'; break;
     case 'logistics_agent': span.textContent = '物流 Agent 查询中...'; break;
     case 'after_sale_agent': span.textContent = '售后 Agent 查询中...'; break;
-    case 'place_order_agent': span.textContent = '下单 Agent 处理中...'; break;
+    case 'cart_query_agent': span.textContent = '购物车 Agent 查询中...'; break;
+    case 'list_orders_agent': span.textContent = '订单列表 Agent 查询中...'; break;
+    case 'product_agent': span.textContent = '商品浏览 Agent 查询中...'; break;
+    case 'place_order_agent': span.textContent = evt.message || '下单处理中...'; break;
+    case 'clarify': span.textContent = '需要您补充信息...'; break;
     case 'finish': span.textContent = '生成回复中...'; break;
+    case 'tool':
+      span.textContent = (evt.status === 'start')
+        ? ('调用工具 ' + evt.name + '...')
+        : ('工具 ' + evt.name + ' 返回 (' + evt.duration_ms + 'ms)');
+      break;
     case 'agent_result':
-      if (evt.content) { addResultBubble(evt.content, evt.route || ''); progressDiv.remove(); }
+      if (evt.content) { addResultBubble(evt.content, currentRoute || evt.route || ''); progressDiv.remove(); }
       break;
     case 'error': progressDiv.remove(); addBubble('assistant', '出错: ' + (evt.message || '未知')); break;
   }
@@ -642,8 +931,10 @@ function statusLabel(s) {
   return m[s] || s;
 }
 function routeLabel(r) {
-  const m = {faq:'FAQ', order:'订单查询', logistics:'物流查询', after_sale:'售后查询', place_order:'下单', finish:'智能回复'};
-  return m[r] || r;
+  const m = {faq:'FAQ', order:'订单查询', logistics:'物流查询', after_sale:'售后查询',
+             place_order:'下单', cart_query:'购物车', list_orders:'订单列表',
+             product:'商品浏览', finish:'智能回复'};
+  return m[r] || r || '智能回复';
 }
 function timeStr(t) { if (!t) return ''; return new Date(t).toLocaleString('zh-CN'); }
 

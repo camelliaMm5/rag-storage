@@ -12,11 +12,61 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # 首次创建数据卷时自动导入 DDL（已有卷不会重复执行）
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U user -d agent"]
       interval: 5s
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    container_name: qa_agent_redis
+    # AOF 持久化 + LRU 淘汰：缓存意外被清只影响命中率，不影响正确性
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # 应用服务：默认不启动（避免与本地 `python main.py` 抢 8000 端口）。
+  # 需要整栈容器化运行时：
+  #   docker compose --profile app up -d --build
+  app:
+    build: .
+    container_name: qa_agent_app
+    profiles: ["app"]
+    env_file: .env
+    environment:
+      # 容器内用服务名互访，覆盖 .env 里的 localhost 地址
+      CONVERSATION_DB_URL: postgresql://user:1234@postgres:5432/agent
+      SHOP_DB_URL: postgresql://user:1234@postgres:5432/agent
+      REDIS_URL: redis://redis:6379/0
+      CHECKPOINT_DB_PATH: /data/checkpoints.db
+    ports:
+      - "8000:8000"
+    volumes:
+      - appdata:/data                     # checkpoints.db 等运行期数据
+      - ./chroma_db:/app/chroma_db        # 复用宿主机已构建好的向量库
+      - ./docs:/app/docs:ro               # FAQ 源文档（只读）
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:
+  redisdata:
+  appdata:

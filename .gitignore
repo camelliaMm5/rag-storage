@@ -1,0 +1,42 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── 环境变量（含密钥，绝不入库；模板见 .env.example）──
+.env
+.env.*
+!.env.example
+
+# ── 运行期数据 / 本地状态 ──
+*.db
+*.db-shm
+*.db-wal
+*.sqlite3
+checkpoints.db*
+conversations.db*
+chroma_db/
+tests/test_chroma_db/
+
+# ── 测试与脚本产物 ──
+_scenario.db
+_test_offline.db
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── 编辑器 / 系统 ──
+# 注意：.vscode/ 是刻意跟踪的（解释器配置 ms-python.python:system），不要忽略
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── 个人工作记录（不入库）──
+.workbuddy/
+
+# ── 日志 ──
+*.log
+logs/

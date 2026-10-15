@@ -1,6 +1,8 @@
-"""LLM service: OpenAI-compatible API wrapper with chat + stream support."""
+"""LLM service: OpenAI-compatible API wrapper with chat + real streaming."""
 import os
 from dotenv import load_dotenv
+
+from llm.usage import estimate_tokens, record_usage
 
 load_dotenv()
 
@@ -38,10 +40,20 @@ class ChatService:
                 temperature=0.3,
                 max_tokens=max_tokens,
             )
+            self._record(resp)
             return resp.choices[0].message.content
         except Exception as e:
             print(f"[LLM Error] {type(e).__name__}: {e}")
             return None
+
+    def _record(self, resp) -> None:
+        """把上游返回的 usage 记进本次请求的计量对象（无则忽略）。"""
+        usage = getattr(resp, "usage", None)
+        record_usage(
+            prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+            completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+            model=self.model,
+        )
 
     def call_raw(self, messages: list[dict], tools: list[dict] | None = None,
                  max_tokens: int = 1024):
@@ -57,7 +69,59 @@ class ChatService:
         )
         if tools:
             kwargs["tools"] = tools
-        return self.client.chat.completions.create(**kwargs)
+        resp = self.client.chat.completions.create(**kwargs)
+        self._record(resp)
+        return resp
+
+    def stream_raw(self, messages: list[dict], tools: list[dict] | None = None,
+                   max_tokens: int = 1024):
+        """真实流式调用：逐 delta yield ``{"content": str, "tool_calls": [...]}``。
+
+        ``tool_calls`` 的每个元素形如
+        ``{"index": int, "id": str, "name": str, "arguments": str}``，与 OpenAI
+        增量格式一致 —— ``arguments`` 是**片段**，必须由上层按 index 拼接。
+        否则带工具调用的流式响应会丢失 tool_calls，ReAct 循环会误判成
+        「不需要工具」而直接返回空回答。
+
+        注意：流式响应默认不返回 usage（需要 ``stream_options.include_usage``，
+        而部分兼容端点不支持该参数、传了会直接报错）。这里不冒这个风险 ——
+        token 用量按字符数估算，并在 trace 里标记 ``estimated=True``。
+        """
+        if not self.available:
+            raise RuntimeError("LLM not available (check LLM_API_KEY)")
+        kwargs = dict(
+            model=self.model,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        if tools:
+            kwargs["tools"] = tools
+
+        text_parts: list[str] = []
+        for chunk in self.client.chat.completions.create(**kwargs):
+            if not getattr(chunk, "choices", None):
+                continue
+            delta = chunk.choices[0].delta
+            content = getattr(delta, "content", None) or ""
+            tool_calls = []
+            for tc in (getattr(delta, "tool_calls", None) or []):
+                fn = getattr(tc, "function", None)
+                tool_calls.append({
+                    "index": getattr(tc, "index", 0) or 0,
+                    "id": getattr(tc, "id", None) or "",
+                    "name": (getattr(fn, "name", None) or "") if fn else "",
+                    "arguments": (getattr(fn, "arguments", None) or "") if fn else "",
+                })
+            if content:
+                text_parts.append(content)
+            if content or tool_calls:
+                yield {"content": content, "tool_calls": tool_calls}
+
+        full = "".join(text_parts)
+        record_usage(completion_tokens=estimate_tokens(full), model=self.model,
+                     streamed=True, estimated=True)
 
     def chat(self, prompt: str, system_prompt: str | None = None) -> str | None:
         """Non-streaming chat. Returns LLM response text."""
@@ -68,8 +132,14 @@ class ChatService:
         return self._call(messages)
 
     def stream(self, prompt: str, system_prompt: str | None = None):
-        """Streaming chat — placeholder for future use."""
-        raise NotImplementedError("stream() not yet implemented")
+        """Convenience: stream plain text deltas for a single prompt."""
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        for delta in self.stream_raw(messages):
+            if delta.get("content"):
+                yield delta["content"]
 
     def rewrite_query(self, question: str) -> str | None:
         """Rewrite colloquial query into precise search terms (legacy)."""

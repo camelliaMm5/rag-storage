@@ -25,19 +25,37 @@ def teardown():
         pass
 
 
+def _ingest_faq(store, docs_dir) -> int:
+    """只灌 5 个 FAQ 文档（``Doc*.md``）—— 与 docs/ 下的工程文档严格隔离。
+
+    早先这里直接 ``ingest_dir(docs_dir)``：``docs/`` 后来混入了项目说明等 .md，
+    于是把「项目文档」也灌进了知识库，既污染检索又让多面查询断言失真。
+    """
+    faq_files = sorted(
+        f for f in os.listdir(docs_dir)
+        if f.startswith("Doc") and f.endswith(".md")
+    )
+    return sum(store.ingest_file(os.path.join(docs_dir, f)) for f in faq_files)
+
+
 def main():
     setup()
 
     # Override db path to test location
     from infrastructure.rag.config import config
+    from infrastructure.rag.store import reset as store_reset2
 
     config.chroma_db_path = TEST_DB_PATH
+    # 关键：store 的 client/collection 是**模块级单例**，import 时已按真实路径建好；
+    # 只改 config 不会换库 —— 必须先 reset 让下一次连接落到临时库，否则测试会写进
+    # 生产知识库（曾把 144 条工程文档灌进真实 chroma_db）。
+    store_reset2()
 
     store = RAGStore()
     docs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs")
 
     # --- Ingest ---
-    total = store.ingest_dir(docs_dir)
+    total = _ingest_faq(store, docs_dir)
     print(f"[INGEST] Total chunks indexed: {total}")
     assert total > 0, "Expected at least 1 chunk"
 
@@ -65,7 +83,9 @@ def main():
         "X1 query must return X1 results, not X2"
 
     # --- Search: multi-faceted query (symptom + warranty) ---
-    results_m = store.search("X1设置键没反应，保修期内，退换还是维修")
+    # top_k 必须 >1：本用例要同时看到「商品域」与「政策域」两个来源，而
+    # _dedup_by_source 保证「每来源 1 条」，默认 top_k=1 时永远只有 1 条结果。
+    results_m = store.search("X1设置键没反应，保修期内，退换还是维修", top_k=5)
     print(f"[SEARCH] multi-facet 'X1设置键没反应保修退换' -> {len(results_m)} results")
     products = [r.metadata.get("product","?") for r in results_m]
     print(f"  sources: {products}")
@@ -99,7 +119,7 @@ def main():
     assert any("保修" in r.text for r in results4), "Expected warranty-related results"
 
     # --- Re-ingest idempotency ---
-    total2 = store.ingest_dir(docs_dir)
+    total2 = _ingest_faq(store, docs_dir)
     print(f"[REINGEST] Chunks after re-ingest: {total2}")
     assert store.count() == total2, "Re-ingest should maintain consistent count"
     assert total2 == total, f"Re-ingest count {total2} should match initial {total}"

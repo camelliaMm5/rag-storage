@@ -1,8 +1,17 @@
 """Internal API — for AI customer service to query business data.
 
 Authentication: X-Internal-Token header.
+
+安全说明：``/internal/*`` 能读到**全量**订单、物流、用户信息（不限 user_id），
+所以它就是「后门」本身，必须靠 token 守住：
+- 比较用 ``hmac.compare_digest``（时序安全；旧版 ``!=`` 会按首个不同字节提前
+  返回，理论上可逐字节爆破）；
+- 生产环境（``APP_ENV=production``）若仍是默认 token，直接 503 拒绝服务，
+  避免「忘了配就走了默认 dev-internal-token」导致数据裸奔。
 """
+import hmac
 import os
+
 from fastapi import APIRouter, Depends, HTTPException, Header, Query
 
 from infrastructure.shop_database import query_one, query_all
@@ -11,13 +20,17 @@ from domain.shop.order import OrderService
 from domain.shop.logistics import LogisticsService
 from domain.shop.after_sale import AfterSaleService
 
-INTERNAL_TOKEN = os.getenv("INTERNAL_API_TOKEN", "dev-internal-token")
+_DEFAULT_INTERNAL_TOKEN = "dev-internal-token"
+APP_ENV = (os.getenv("APP_ENV") or "development").strip().lower()
+INTERNAL_TOKEN = os.getenv("INTERNAL_API_TOKEN", _DEFAULT_INTERNAL_TOKEN)
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
 
 def verify_internal(x_internal_token: str = Header(...)):
-    if x_internal_token != INTERNAL_TOKEN:
+    if INTERNAL_TOKEN == _DEFAULT_INTERNAL_TOKEN and APP_ENV == "production":
+        raise HTTPException(503, "internal API token not configured")
+    if not hmac.compare_digest(x_internal_token, INTERNAL_TOKEN):
         raise HTTPException(401, "Invalid internal token")
     return True
 

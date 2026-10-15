@@ -64,6 +64,7 @@ CREATE TABLE shop.orders (
     total_amount    DECIMAL(10,2) NOT NULL,
     status          VARCHAR(20) DEFAULT 'pending',
     address         TEXT NOT NULL,
+    recipient       VARCHAR(64),
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     paid_at         TIMESTAMPTZ,
     cancelled_at    TIMESTAMPTZ
@@ -146,6 +147,29 @@ CREATE TABLE IF NOT EXISTS customer_service.messages (
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON customer_service.messages(conversation_id, turn_number);
+
+-- Agent 执行轨迹（可观测性）：每次请求一行，记录路由决策、工具调用、耗时、失败原因
+CREATE TABLE IF NOT EXISTS customer_service.agent_traces (
+    id              BIGSERIAL PRIMARY KEY,
+    conversation_id VARCHAR(36),
+    user_id         VARCHAR(128),
+    user_input      TEXT,
+    route           VARCHAR(32),
+    extract         TEXT,
+    agent_nodes     JSONB DEFAULT '[]',
+    tool_calls      JSONB DEFAULT '[]',
+    final_content   TEXT,
+    status          VARCHAR(16) DEFAULT 'ok',
+    error           TEXT,
+    duration_ms     INTEGER,
+    llm_calls       INTEGER DEFAULT 0,
+    prompt_tokens   INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_traces_conv    ON customer_service.agent_traces(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_traces_created ON customer_service.agent_traces(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_traces_status  ON customer_service.agent_traces(status);
 
 -- ============================================
 -- 种子数据: 分类

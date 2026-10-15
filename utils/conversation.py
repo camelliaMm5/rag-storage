@@ -1,4 +1,5 @@
 """ConversationManager — session CRUD and context window management."""
+import threading
 import uuid
 from datetime import datetime
 
@@ -8,9 +9,42 @@ from infrastructure.database import SessionLocal
 from infrastructure.models import Base, Conversation, Message
 
 
+class KeyedLocks:
+    """按 key 分配互斥锁（进程内）。
+
+    用于消除 ``add_message`` 的经典竞态：``SELECT max(turn_number)`` 与
+    ``INSERT`` 之间存在窗口，同一会话的并发请求会算出同一个 turn_number，
+    导致消息顺序错乱。
+
+    局限（已明确记录）：只在单进程内有效。多副本部署时应改为数据库层锁
+    （对 ``conversations`` 行做 ``SELECT ... FOR UPDATE``）或
+    ``INSERT ... ON CONFLICT`` 重试。
+    """
+
+    def __init__(self, maxsize: int = 2048):
+        self._guard = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
+        self._maxsize = maxsize
+
+    def get(self, key: str) -> threading.Lock:
+        with self._guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                if len(self._locks) >= self._maxsize:
+                    for k in [k for k, v in self._locks.items() if not v.locked()][:512]:
+                        self._locks.pop(k, None)
+                lock = threading.Lock()
+                self._locks[key] = lock
+            return lock
+
+    def __len__(self) -> int:  # pragma: no cover - 便于测试断言
+        return len(self._locks)
+
+
 class ConversationManager:
     def __init__(self, max_context_turns: int = 10):
         self.max_context_turns = max_context_turns
+        self._locks = KeyedLocks()
         Base.metadata.create_all(bind=SessionLocal.kw["bind"])
 
     def create(self, user_id: str) -> str:
@@ -25,41 +59,54 @@ class ConversationManager:
     def add_message(
         self, conversation_id: str, role: str, content: str, metadata: dict | None = None
     ) -> int:
-        """Append a message. Auto-calculates turn_number by role. Returns message id."""
+        """Append a message. turn_number is computed under a per-conversation lock."""
+        with self._locks.get(conversation_id):
+            with SessionLocal() as db:
+                max_turn = (
+                    db.query(func.max(Message.turn_number))
+                    .filter(Message.conversation_id == conversation_id)
+                    .scalar()
+                ) or 0
+
+                turn_number = max_turn + 1 if role == "user" else max_turn
+
+                msg = Message(
+                    conversation_id=conversation_id,
+                    role=role,
+                    content=content,
+                    turn_number=turn_number,
+                    metadata_=metadata or {},
+                )
+                db.add(msg)
+                db.flush()
+
+                # Auto-title from first user message
+                conv = (
+                    db.query(Conversation)
+                    .filter(Conversation.conversation_id == conversation_id)
+                    .first()
+                )
+                if conv and not conv.title and role == "user":
+                    conv.title = content[:80]
+                if conv:
+                    conv.updated_at = datetime.utcnow()
+
+                db.commit()
+                return msg.id
+
+    def get_owner(self, conversation_id: str) -> str | None:
+        """Return the user_id owning this conversation, or None if it does not exist.
+
+        用于接口层的越权校验（IDOR）—— 否则任何登录用户都能凭 conversation_id
+        读取/写入他人的会话。
+        """
         with SessionLocal() as db:
-            max_turn = (
-                db.query(func.max(Message.turn_number))
-                .filter(Message.conversation_id == conversation_id)
-                .scalar()
-            ) or 0
-
-            if role == "user":
-                turn_number = max_turn + 1
-            else:
-                turn_number = max_turn
-
-            msg = Message(
-                conversation_id=conversation_id,
-                role=role,
-                content=content,
-                turn_number=turn_number,
-                metadata_=metadata or {},
-            )
-            db.add(msg)
-            db.flush()
-
-            # Auto-title from first user message
-            conv = (
-                db.query(Conversation)
+            row = (
+                db.query(Conversation.user_id)
                 .filter(Conversation.conversation_id == conversation_id)
                 .first()
             )
-            if conv and not conv.title and role == "user":
-                conv.title = content[:80]
-
-            conv.updated_at = datetime.utcnow()
-            db.commit()
-            return msg.id
+        return row[0] if row else None
 
     def get_context(self, conversation_id: str) -> list[dict]:
         """Return recent messages within context window, ordered by time ascending."""
